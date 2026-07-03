@@ -1,0 +1,152 @@
+name: Cache GHCR Write No Restore Impact
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_key:
+        description: ASCII base key. Trusted primary is <base>-prod; hidden seed is expected to be <base>-prod<U+200B>.
+        required: true
+        default: ghcr-write-no-restore
+      image_name:
+        description: Lab-only GHCR image name.
+        required: true
+        default: ghcr.io/cookiekuma123/cache-package-write-proof
+      image_tag:
+        description: Mutable lab tag to push/overwrite.
+        required: true
+        default: lab
+
+permissions:
+  actions: write
+  contents: read
+  packages: write
+
+jobs:
+  package-write:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve no-restore package proof key
+        id: key
+        shell: bash
+        env:
+          BASE_KEY: ${{ inputs.base_key }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          const base = process.env.BASE_KEY || '';
+          const primaryKey = `${base}-prod`;
+          const expectedHiddenKey = `${primaryKey}\u200b`;
+          const metadata = {
+            event: 'workflow_dispatch',
+            primaryKey: describe(primaryKey),
+            expectedHiddenKey: describe(expectedHiddenKey),
+            restoreKeys: [],
+            imageName: process.env.IMAGE_NAME,
+            imageTag: process.env.IMAGE_TAG,
+            runId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `primary_key<<EOF\n${primaryKey}\nEOF\n`);
+          fs.writeFileSync('observations/ghcr-write-no-restore-key.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+
+      - name: Restore deploy tool cache without restore-keys
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: deploy-tools
+          key: ${{ steps.key.outputs.primary_key }}
+
+      - name: Record cache outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "restore-keys-used=false"
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.cache.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.cache.outputs.cache-matched-key }}"
+            echo "trusted-primary-key=${{ steps.key.outputs.primary_key }}"
+            echo "image-name=${{ inputs.image_name }}"
+            echo "image-tag=${{ inputs.image_tag }}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Stop unless exact cache hit is reported
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "exact-cache-required=true" | tee observations/exact-gate-failed.txt
+          exit 1
+
+      - name: Run cached GHCR writer with trusted token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAB_DEPLOY_SECRET: ${{ secrets.LAB_DEPLOY_SECRET }}
+          LAB_GHCR_WRITE_PROOF: "true"
+          LAB_GHCR_IMAGE: ${{ inputs.image_name }}
+          LAB_GHCR_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          if [[ -x deploy-tools/deploy.sh ]]; then
+            ./deploy-tools/deploy.sh | tee observations/ghcr-write-output.txt
+          else
+            printf 'deploy-tool-missing=true\n' | tee observations/ghcr-write-output.txt
+            exit 1
+          fi
+
+      - name: Verify GHCR image labels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          docker image rm "$IMAGE_NAME:$IMAGE_TAG" >/dev/null 2>&1 || true
+          docker pull "$IMAGE_NAME:$IMAGE_TAG"
+          {
+            echo "downloaded-package-image=true"
+            echo "image-name=$IMAGE_NAME"
+            echo "image-tag=$IMAGE_TAG"
+            echo "image-digest=$(docker image inspect --format='{{index .RepoDigests 0}}' "$IMAGE_NAME:$IMAGE_TAG")"
+            echo "image-labels=$(docker image inspect --format='{{json .Config.Labels}}' "$IMAGE_NAME:$IMAGE_TAG")"
+          } | tee observations/ghcr-image-verification.txt
+
+      - name: Inspect observations
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find deploy-tools package-proof observations -maxdepth 4 -type f -print -exec sed -n '1,80p' {} \; || true
+
+      - name: Upload observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-ghcr-write-no-restore-impact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn

@@ -1,0 +1,239 @@
+name: Cache Canonicalization Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Cache operation to run.
+        type: choice
+        required: true
+        default: roundtrip
+        options:
+          - save
+          - lookup
+          - restore
+          - roundtrip
+          - list
+          - delete-key
+      driver:
+        description: Cache client surface to exercise.
+        type: choice
+        required: true
+        default: both
+        options:
+          - action
+          - toolkit
+          - both
+          - api
+      cache_key:
+        description: Base primary cache key. Use a fresh key for each save trial.
+        required: true
+        default: canon-lab-v1
+      key_variant:
+        description: Representation variant applied to cache_key.
+        type: choice
+        required: true
+        default: literal
+        options:
+          - literal
+          - upper
+          - lower
+          - leading-space
+          - trailing-space
+          - slash
+          - url-encoded-space
+          - percent2f
+          - nfc-e-acute
+          - nfd-e-acute
+          - case-pair-lower
+          - case-pair-upper
+          - comma-invalid
+          - max-512
+          - over-512-invalid
+      path_variant:
+        description: Path spelling used for the cache path input.
+        type: choice
+        required: true
+        default: relative
+        options:
+          - relative
+          - dot-relative
+          - workspace-absolute
+          - parent-normalized
+          - symlink
+          - glob-fixture
+          - trailing-space
+          - leading-space
+          - duplicate-relative
+          - multi-a-b
+          - multi-b-a
+          - case-distinct
+      toolkit_path_parse_mode:
+        description: How the direct toolkit script should parse path strings.
+        type: choice
+        required: true
+        default: raw
+        options:
+          - raw
+          - action-trim
+      enable_cross_os_archive:
+        description: Pass enableCrossOsArchive to action/toolkit.
+        type: boolean
+        required: true
+        default: false
+      payload_label:
+        description: Text written into the saved payload.
+        required: true
+        default: seed
+      restore_keys:
+        description: Optional restore keys, newline-separated.
+        required: false
+        default: ""
+      api_ref:
+        description: Optional REST API ref filter, e.g. refs/heads/main or refs/pull/1/merge.
+        required: false
+        default: ""
+      runner_debug:
+        description: Enable toolkit/action debug logs where the runner honors RUNNER_DEBUG.
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  lab:
+    name: ${{ inputs.driver }} / ${{ inputs.operation }} / ${{ inputs.key_variant }} / ${{ inputs.path_variant }}
+    runs-on: ubuntu-latest
+    env:
+      LAB_OPERATION: ${{ inputs.operation }}
+      LAB_DRIVER: ${{ inputs.driver }}
+      LAB_ENABLE_CROSS_OS_ARCHIVE: ${{ inputs.enable_cross_os_archive }}
+      LAB_TOOLKIT_PATH_PARSE_MODE: ${{ inputs.toolkit_path_parse_mode }}
+      RUNNER_DEBUG: ${{ inputs.runner_debug && '1' || '' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install lab dependencies
+        run: npm ci
+
+      - name: Resolve lab inputs
+        id: lab
+        env:
+          LAB_INPUT_CACHE_KEY: ${{ inputs.cache_key }}
+          LAB_INPUT_KEY_VARIANT: ${{ inputs.key_variant }}
+          LAB_INPUT_PATH_VARIANT: ${{ inputs.path_variant }}
+          LAB_INPUT_RESTORE_KEYS: ${{ inputs.restore_keys }}
+        run: npm run resolve
+
+      - name: Prepare fixture directories
+        env:
+          LAB_CACHE_KEY: ${{ steps.lab.outputs.cache_key }}
+          LAB_PATHS_JSON: ${{ steps.lab.outputs.paths_json }}
+          LAB_PAYLOAD_LABEL: ${{ inputs.payload_label }}
+        run: npm run fixtures
+
+      - name: REST list before
+        if: ${{ always() && inputs.operation != 'delete-key' }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LAB_API_ACTION: list
+          LAB_API_LABEL: before
+          LAB_API_KEY: ${{ steps.lab.outputs.cache_key }}
+          LAB_API_REF: ${{ inputs.api_ref }}
+        run: npm run api
+
+      - name: Restore via actions/cache
+        id: action_restore
+        if: ${{ (inputs.driver == 'action' || inputs.driver == 'both') && inputs.operation != 'list' && inputs.operation != 'delete-key' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.lab.outputs.paths_multiline }}
+          key: ${{ steps.lab.outputs.cache_key }}
+          restore-keys: ${{ steps.lab.outputs.restore_keys_multiline }}
+          lookup-only: ${{ inputs.operation == 'lookup' || inputs.operation == 'save' || inputs.operation == 'roundtrip' }}
+          enableCrossOsArchive: ${{ inputs.enable_cross_os_archive }}
+
+      - name: Report actions/cache restore result
+        if: ${{ always() && (inputs.driver == 'action' || inputs.driver == 'both') && inputs.operation != 'list' && inputs.operation != 'delete-key' }}
+        shell: bash
+        run: |
+          {
+            echo "action-cache-hit=${{ steps.action_restore.outputs.cache-hit }}"
+            echo "action-cache-primary-key=${{ steps.action_restore.outputs.cache-primary-key }}"
+            echo "action-cache-matched-key=${{ steps.action_restore.outputs.cache-matched-key }}"
+            echo "raw-predicted-version=${{ steps.lab.outputs.raw_predicted_version }}"
+            echo "action-trim-predicted-version=${{ steps.lab.outputs.action_trim_predicted_version }}"
+            echo "compression-method=${{ steps.lab.outputs.compression_method }}"
+          } | tee -a cache-result.txt
+
+      - name: Save via actions/cache
+        if: ${{ (inputs.driver == 'action' || inputs.driver == 'both') && (inputs.operation == 'save' || inputs.operation == 'roundtrip') && steps.action_restore.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.lab.outputs.paths_multiline }}
+          key: ${{ steps.lab.outputs.cache_key }}
+          enableCrossOsArchive: ${{ inputs.enable_cross_os_archive }}
+
+      - name: Run direct @actions/cache toolkit
+        if: ${{ (inputs.driver == 'toolkit' || inputs.driver == 'both') && inputs.operation != 'list' && inputs.operation != 'delete-key' }}
+        uses: ./.github/actions/cache-toolkit
+        env:
+          LAB_CACHE_KEY: ${{ steps.lab.outputs.cache_key }}
+          LAB_PATHS_JSON: ${{ steps.lab.outputs.paths_json }}
+          LAB_RESTORE_KEYS_JSON: ${{ steps.lab.outputs.restore_keys_json }}
+
+      - name: Delete via REST API by key
+        if: ${{ inputs.operation == 'delete-key' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LAB_API_ACTION: delete-key
+          LAB_API_LABEL: delete-key
+          LAB_API_KEY: ${{ steps.lab.outputs.cache_key }}
+          LAB_API_REF: ${{ inputs.api_ref }}
+        run: npm run api
+
+      - name: REST list after
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LAB_API_ACTION: list
+          LAB_API_LABEL: after
+          LAB_API_KEY: ${{ steps.lab.outputs.cache_key }}
+          LAB_API_REF: ${{ inputs.api_ref }}
+        run: npm run api
+
+      - name: Inspect restored or saved files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Workspace files after cache operation:"
+          find cache-fixture 'cache-fixture ' ' cache-fixture' Cache-Fixture cache-fixture-a cache-fixture-b -maxdepth 2 -type f -print -exec sed -n '1,20p' {} \; || true
+
+          echo "Symlink status:"
+          ls -la cache-link || true
+
+      - name: Upload lab observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-canonicalization-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            lab-observations/
+            cache-result.txt
+          if-no-files-found: warn

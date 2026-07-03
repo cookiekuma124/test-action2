@@ -1,0 +1,153 @@
+name: Cache Release Write No Restore Impact
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_key:
+        description: ASCII base key. Trusted primary is <base>-prod; hidden seed is expected to be <base>-prod<U+200B>.
+        required: true
+        default: release-write-no-restore
+      release_tag:
+        description: Lab-only release tag to overwrite.
+        required: true
+        default: cache-release-write-proof
+      asset_name:
+        description: Lab-only release asset name to overwrite.
+        required: true
+        default: cache-release-write-proof.txt
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  release-write:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve no-restore release proof key
+        id: key
+        shell: bash
+        env:
+          BASE_KEY: ${{ inputs.base_key }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          const base = process.env.BASE_KEY || '';
+          const primaryKey = `${base}-prod`;
+          const expectedHiddenKey = `${primaryKey}\u200b`;
+          const metadata = {
+            event: 'workflow_dispatch',
+            primaryKey: describe(primaryKey),
+            expectedHiddenKey: describe(expectedHiddenKey),
+            restoreKeys: [],
+            releaseTag: process.env.RELEASE_TAG,
+            assetName: process.env.ASSET_NAME,
+            runId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `primary_key<<EOF\n${primaryKey}\nEOF\n`);
+          fs.writeFileSync('observations/release-write-no-restore-key.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+
+      - name: Restore deploy tool cache without restore-keys
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: deploy-tools
+          key: ${{ steps.key.outputs.primary_key }}
+
+      - name: Record cache outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "restore-keys-used=false"
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.cache.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.cache.outputs.cache-matched-key }}"
+            echo "trusted-primary-key=${{ steps.key.outputs.primary_key }}"
+            echo "release-tag=${{ inputs.release_tag }}"
+            echo "asset-name=${{ inputs.asset_name }}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Stop unless exact cache hit is reported
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "exact-cache-required=true" | tee observations/exact-gate-failed.txt
+          exit 1
+
+      - name: Run cached release writer with trusted token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAB_DEPLOY_SECRET: ${{ secrets.LAB_DEPLOY_SECRET }}
+          LAB_RELEASE_WRITE_PROOF: "true"
+          LAB_RELEASE_TAG: ${{ inputs.release_tag }}
+          LAB_RELEASE_ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          if [[ -x deploy-tools/deploy.sh ]]; then
+            ./deploy-tools/deploy.sh | tee observations/release-write-output.txt
+          else
+            printf 'deploy-tool-missing=true\n' | tee observations/release-write-output.txt
+            exit 1
+          fi
+
+      - name: Verify release asset content
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations/downloaded-release-asset
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET_NAME" \
+            --dir observations/downloaded-release-asset \
+            --clobber
+          {
+            echo "downloaded-release-asset=true"
+            echo "release-tag=$RELEASE_TAG"
+            echo "asset-name=$ASSET_NAME"
+            sha256sum "observations/downloaded-release-asset/$ASSET_NAME"
+            sed -n '1,80p' "observations/downloaded-release-asset/$ASSET_NAME"
+          } | tee observations/release-asset-verification.txt
+
+      - name: Inspect observations
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find deploy-tools observations -maxdepth 4 -type f -print -exec sed -n '1,80p' {} \; || true
+
+      - name: Upload observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-release-write-no-restore-impact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn

@@ -1,0 +1,141 @@
+name: Cache Gated Install Impact
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Seed an NFC cache or probe with an NFD primary key.
+        type: choice
+        required: true
+        default: seed-nfc
+        options:
+          - seed-nfc
+          - probe-nfd
+      base_key:
+        description: ASCII base key shared by the seed and probe runs.
+        required: true
+        default: gated-impact
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  gated-install:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve cache key
+        id: key
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          BASE_KEY: ${{ inputs.base_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const mode = process.env.MODE;
+          const base = process.env.BASE_KEY;
+          const variant = mode === 'seed-nfc' ? 'nfc-e-acute' : 'nfd-e-acute';
+          const key = variant === 'nfc-e-acute' ? `${base}-\u00e9` : `${base}-e\u0301`;
+          const restoreKey = `${base}-`;
+          const installLabel =
+            mode === 'seed-nfc' ? 'seeded-nfc-toolchain' : 'fresh-nfd-toolchain';
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cache_key<<EOF\n${key}\nEOF\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `restore_key<<EOF\n${restoreKey}\nEOF\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `install_label=${installLabel}\n`);
+          fs.writeFileSync(
+            'observations/key.json',
+            `${JSON.stringify(
+              {
+                mode,
+                variant,
+                key: describe(key),
+                restoreKey: describe(restoreKey),
+                installLabel
+              },
+              null,
+              2
+            )}\n`
+          );
+          NODE
+
+      - name: Restore dependency toolchain
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: toolchain
+          key: ${{ steps.key.outputs.cache_key }}
+          restore-keys: ${{ steps.key.outputs.restore_key }}
+
+      - name: Record cache outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.cache.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.cache.outputs.cache-matched-key }}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Install dependencies when cache is not exact
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          INSTALL_LABEL: ${{ steps.key.outputs.install_label }}
+          CACHE_KEY: ${{ steps.key.outputs.cache_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p toolchain observations
+          cat > toolchain/tool.sh <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "tool-label=${INSTALL_LABEL}"
+          echo "tool-cache-key=${CACHE_KEY}"
+          EOF
+          chmod +x toolchain/tool.sh
+          printf 'install-ran=true\n' | tee observations/install-ran.txt
+
+      - name: Run dependency tool
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          if [[ -x toolchain/tool.sh ]]; then
+            ./toolchain/tool.sh | tee observations/tool-output.txt
+          else
+            printf 'tool-missing=true\n' | tee observations/tool-output.txt
+          fi
+
+      - name: Inspect toolchain
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find toolchain observations -maxdepth 2 -type f -print -exec sed -n '1,20p' {} \; || true
+
+      - name: Upload observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-gated-install-impact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn

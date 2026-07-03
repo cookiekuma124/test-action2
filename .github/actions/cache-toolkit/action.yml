@@ -1,0 +1,5 @@
+name: Cache Toolkit Probe
+description: Run direct @actions/cache calls inside an action runtime context.
+runs:
+  using: node24
+  main: ../../../scripts/cache-toolkit.mjs

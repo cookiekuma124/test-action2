@@ -1,0 +1,151 @@
+name: Cache Workflow Run Seed
+
+on:
+  workflow_run:
+    workflows:
+      - Cache PR Artifact Source
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  seed:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve workflow_run cache key
+        id: key
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          const cacheKey = process.env.HEAD_BRANCH || '';
+          if (!cacheKey) {
+            throw new Error('workflow_run.head_branch was empty');
+          }
+
+          const metadata = {
+            event: 'workflow_run',
+            sourceWorkflowRunId: process.env.SOURCE_RUN_ID,
+            sourceConclusion: process.env.SOURCE_CONCLUSION,
+            headBranch: describe(cacheKey),
+            headRepo: process.env.HEAD_REPO,
+            headSha: process.env.HEAD_SHA,
+            seedRunId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cache_key<<EOF\n${cacheKey}\nEOF\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `source_run_id=${process.env.SOURCE_RUN_ID}\n`);
+          fs.writeFileSync('observations/workflow-run-metadata.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+
+      - name: Restore or reserve workflow_run cache
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: deploy-tools
+          key: ${{ steps.key.outputs.cache_key }}
+
+      - name: Record cache outputs before seed
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.cache.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.cache.outputs.cache-matched-key }}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Download low-trust PR artifact
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ steps.key.outputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloaded observations
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name pr-cache-seed-payload \
+            --dir downloaded
+          find downloaded -maxdepth 4 -type f -print | sort | tee observations/downloaded-files.txt
+
+      - name: Promote PR artifact into cache path
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf deploy-tools
+          if [[ -d downloaded/deploy-tools ]]; then
+            cp -R downloaded/deploy-tools deploy-tools
+          elif [[ -d downloaded/payload/deploy-tools ]]; then
+            cp -R downloaded/payload/deploy-tools deploy-tools
+          else
+            echo "deploy-tools artifact payload was missing" >&2
+            find downloaded -maxdepth 4 -type f -print >&2 || true
+            exit 1
+          fi
+          chmod +x deploy-tools/deploy.sh
+          {
+            echo "promoted-from-workflow-run=${{ steps.key.outputs.source_run_id }}"
+            echo "cache-key=${{ steps.key.outputs.cache_key }}"
+          } | tee observations/promoted.txt
+
+      - name: Inspect seed result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find deploy-tools observations -maxdepth 3 -type f -print -exec sed -n '1,40p' {} \; || true
+
+      - name: Upload workflow_run seed observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-workflow-run-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn
+
+      - name: Dispatch default-branch cache seed
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_KEY: ${{ steps.key.outputs.cache_key }}
+          SOURCE_RUN_ID: ${{ steps.key.outputs.source_run_id }}
+          SOURCE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run cache-dispatched-seed.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f cache_key="$CACHE_KEY" \
+            -f source_run_id="$SOURCE_RUN_ID" \
+            -f source_head_sha="$SOURCE_HEAD_SHA"

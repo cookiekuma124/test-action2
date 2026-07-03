@@ -1,0 +1,81 @@
+name: Cache Ref Scope Lab
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      cache_key:
+        description: Shared key used for ref-scope probing.
+        required: true
+        default: scope-lab-shared-v1
+      save_on_miss:
+        description: Save the cache if the exact key is not restored.
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  scope:
+    runs-on: ubuntu-latest
+    env:
+      SCOPE_KEY: ${{ github.event_name == 'workflow_dispatch' && inputs.cache_key || 'scope-lab-shared-v1' }}
+      SAVE_ON_MISS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_on_miss || true }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Prepare scope fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cache-fixture
+          {
+            echo "scope_key=$SCOPE_KEY"
+            echo "github_event_name=$GITHUB_EVENT_NAME"
+            echo "github_ref=$GITHUB_REF"
+            echo "github_ref_name=$GITHUB_REF_NAME"
+            echo "github_base_ref=$GITHUB_BASE_REF"
+            echo "github_head_ref=$GITHUB_HEAD_REF"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "created_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > cache-fixture/scope.txt
+
+      - name: Restore scope cache
+        id: scope_restore
+        uses: actions/cache/restore@v6
+        with:
+          path: cache-fixture
+          key: ${{ env.SCOPE_KEY }}
+          lookup-only: true
+
+      - name: Report scope result
+        shell: bash
+        run: |
+          {
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "ref=$GITHUB_REF"
+            echo "base_ref=$GITHUB_BASE_REF"
+            echo "head_ref=$GITHUB_HEAD_REF"
+            echo "cache-hit=${{ steps.scope_restore.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.scope_restore.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.scope_restore.outputs.cache-matched-key }}"
+          } | tee cache-result.txt
+
+      - name: Save scope cache
+        if: ${{ env.SAVE_ON_MISS == 'true' && steps.scope_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: cache-fixture
+          key: ${{ env.SCOPE_KEY }}

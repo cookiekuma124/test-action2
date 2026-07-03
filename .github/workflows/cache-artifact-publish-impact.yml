@@ -1,0 +1,134 @@
+name: Cache Artifact Publish Impact
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Seed a lowercase cache or probe with an uppercase primary key.
+        type: choice
+        required: true
+        default: seed-lower
+        options:
+          - seed-lower
+          - probe-upper
+      base_key:
+        description: ASCII base key shared by the seed and probe runs.
+        required: true
+        default: publish-impact
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve cache key
+        id: key
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          BASE_KEY: ${{ inputs.base_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const mode = process.env.MODE;
+          const base = process.env.BASE_KEY;
+          const suffix = mode === 'seed-lower' ? 'case' : 'CASE';
+          const key = `${base}-${suffix}`;
+          const restoreKey = `${base}-`;
+          const artifactLabel =
+            mode === 'seed-lower' ? 'seeded-lower-dist' : 'fresh-upper-dist';
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cache_key<<EOF\n${key}\nEOF\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `restore_key<<EOF\n${restoreKey}\nEOF\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `artifact_label=${artifactLabel}\n`);
+          fs.writeFileSync(
+            'observations/key.json',
+            `${JSON.stringify(
+              {
+                mode,
+                key: describe(key),
+                restoreKey: describe(restoreKey),
+                artifactLabel
+              },
+              null,
+              2
+            )}\n`
+          );
+          NODE
+
+      - name: Restore dist cache
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: dist
+          key: ${{ steps.key.outputs.cache_key }}
+          restore-keys: ${{ steps.key.outputs.restore_key }}
+
+      - name: Record cache outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.cache.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.cache.outputs.cache-matched-key }}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Build release artifact when cache is not exact
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          ARTIFACT_LABEL: ${{ steps.key.outputs.artifact_label }}
+          CACHE_KEY: ${{ steps.key.outputs.cache_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist observations
+          {
+            echo "artifact-label=${ARTIFACT_LABEL}"
+            echo "artifact-cache-key=${CACHE_KEY}"
+            echo "run-id=${GITHUB_RUN_ID}"
+          } | tee dist/release.txt
+          printf 'build-ran=true\n' | tee observations/build-ran.txt
+
+      - name: Publish release artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          if [[ -f dist/release.txt ]]; then
+            cp dist/release.txt observations/published-release.txt
+          else
+            printf 'artifact-missing=true\n' | tee observations/published-release.txt
+          fi
+          sed -n '1,20p' observations/published-release.txt
+
+      - name: Upload published dist
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: published-dist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/
+            observations/
+          if-no-files-found: warn

@@ -1,0 +1,135 @@
+name: Cache Dispatched Seed
+
+on:
+  workflow_dispatch:
+    inputs:
+      cache_key:
+        description: Raw key to save. In the chain this is workflow_run.head_branch.
+        required: true
+      source_run_id:
+        description: Low-trust pull_request run that produced pr-cache-seed-payload.
+        required: true
+      source_head_sha:
+        description: Source pull_request head SHA for audit.
+        required: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve dispatched cache seed inputs
+        id: seed
+        shell: bash
+        env:
+          CACHE_KEY: ${{ inputs.cache_key }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_HEAD_SHA: ${{ inputs.source_head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          const cacheKey = process.env.CACHE_KEY || '';
+          if (!cacheKey) {
+            throw new Error('cache_key input was empty');
+          }
+
+          const metadata = {
+            event: 'workflow_dispatch',
+            cacheKey: describe(cacheKey),
+            sourceRunId: process.env.SOURCE_RUN_ID,
+            sourceHeadSha: process.env.SOURCE_HEAD_SHA,
+            seedRunId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cache_key<<EOF\n${cacheKey}\nEOF\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `source_run_id=${process.env.SOURCE_RUN_ID}\n`);
+          fs.writeFileSync('observations/dispatched-seed-metadata.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+
+      - name: Restore or reserve dispatched cache
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: deploy-tools
+          key: ${{ steps.seed.outputs.cache_key }}
+
+      - name: Record cache outputs before seed
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.cache.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.cache.outputs.cache-matched-key }}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Download low-trust PR artifact
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ steps.seed.outputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloaded observations
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name pr-cache-seed-payload \
+            --dir downloaded
+          find downloaded -maxdepth 4 -type f -print | sort | tee observations/downloaded-files.txt
+
+      - name: Promote PR artifact into cache path
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf deploy-tools
+          if [[ -d downloaded/deploy-tools ]]; then
+            cp -R downloaded/deploy-tools deploy-tools
+          elif [[ -d downloaded/payload/deploy-tools ]]; then
+            cp -R downloaded/payload/deploy-tools deploy-tools
+          else
+            echo "deploy-tools artifact payload was missing" >&2
+            find downloaded -maxdepth 4 -type f -print >&2 || true
+            exit 1
+          fi
+          chmod +x deploy-tools/deploy.sh
+          {
+            echo "promoted-from-pr-run=${{ steps.seed.outputs.source_run_id }}"
+            echo "cache-key=${{ steps.seed.outputs.cache_key }}"
+          } | tee observations/promoted.txt
+
+      - name: Inspect dispatched seed result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find deploy-tools observations -maxdepth 3 -type f -print -exec sed -n '1,40p' {} \; || true
+
+      - name: Upload dispatched seed observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-dispatched-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn

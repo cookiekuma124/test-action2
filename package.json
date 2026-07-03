@@ -1,0 +1,18 @@
+{
+  "name": "github-actions-cache-canonicalization-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated lab for GitHub Actions cache canonicalization experiments.",
+  "scripts": {
+    "resolve": "node scripts/resolve-lab-inputs.mjs",
+    "fixtures": "node scripts/prepare-fixtures.mjs",
+    "toolkit": "node scripts/cache-toolkit.mjs",
+    "api": "node scripts/rest-cache-api.mjs",
+    "github:lab": "node scripts/automate-github-lab.mjs",
+    "check": "node --check scripts/lab-common.mjs && node --check scripts/resolve-lab-inputs.mjs && node --check scripts/prepare-fixtures.mjs && node --check scripts/cache-toolkit.mjs && node --check scripts/rest-cache-api.mjs && node --check scripts/automate-github-lab.mjs"
+  },
+  "dependencies": {
+    "@actions/cache": "6.1.0"
+  }
+}

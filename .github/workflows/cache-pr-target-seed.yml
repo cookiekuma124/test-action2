@@ -1,0 +1,122 @@
+name: Cache PR Target Seed
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR cache key
+        id: key
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const key = process.env.HEAD_REF;
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cache_key<<EOF\n${key}\nEOF\n`);
+          fs.writeFileSync(
+            'observations/pr-key.json',
+            `${JSON.stringify(
+              {
+                event: process.env.GITHUB_EVENT_NAME,
+                baseRef: process.env.GITHUB_BASE_REF,
+                headRef: describe(process.env.HEAD_REF),
+                headRepo: process.env.HEAD_REPO,
+                headSha: process.env.HEAD_SHA
+              },
+              null,
+              2
+            )}\n`
+          );
+          NODE
+
+      - name: Restore or save deploy tool seeded from PR metadata
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: deploy-tools
+          key: ${{ steps.key.outputs.cache_key }}
+
+      - name: Record cache outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-key=${{ steps.key.outputs.cache_key }}"
+            echo "github-ref=${GITHUB_REF}"
+            echo "github-base-ref=${GITHUB_BASE_REF}"
+            echo "github-head-ref=${GITHUB_HEAD_REF}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Create PR-seeded deploy tool
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          CACHE_KEY: ${{ steps.key.outputs.cache_key }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p deploy-tools observations
+          cat > deploy-tools/deploy.sh <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "tool-label=external-pr-target-seeded-tool"
+          echo "tool-cache-key=${CACHE_KEY}"
+          echo "tool-source-repo=${HEAD_REPO}"
+          echo "tool-source-sha=${HEAD_SHA}"
+          if [[ -n "\${LAB_DEPLOY_SECRET:-}" ]]; then
+            echo "secret-visible-to-tool=true"
+          else
+            echo "secret-visible-to-tool=false"
+          fi
+          echo "deploy-target=production"
+          EOF
+          chmod +x deploy-tools/deploy.sh
+          printf 'prepare-ran=true\n' | tee observations/prepare-ran.txt
+
+      - name: Inspect observations
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find deploy-tools observations -maxdepth 2 -type f -print -exec sed -n '1,30p' {} \; || true
+
+      - name: Upload observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-pr-target-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn

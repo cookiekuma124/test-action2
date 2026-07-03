@@ -1,0 +1,131 @@
+name: Cache Issue Comment Dispatch Seed
+
+on:
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  actions: write
+  contents: write
+  issues: read
+  pull-requests: read
+
+jobs:
+  dispatch:
+    if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '/cache-comment-seed ') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve issue comment cache seed
+        id: seed
+        shell: bash
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ACTOR: ${{ github.event.comment.user.login }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations comment-direct-tools
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          const body = process.env.COMMENT_BODY || '';
+          const firstLine = body.split(/\r?\n/)[0] || '';
+          const prefix = '/cache-comment-seed ';
+          if (!firstLine.startsWith(prefix)) {
+            throw new Error('comment command prefix missing');
+          }
+          const cacheKey = firstLine.slice(prefix.length);
+          if (!cacheKey) {
+            throw new Error('cache key was empty');
+          }
+
+          const metadata = {
+            event: 'issue_comment',
+            cacheKey: describe(cacheKey),
+            directProbeKey: describe(`${cacheKey}-direct`),
+            commentActor: process.env.COMMENT_ACTOR,
+            commentId: process.env.COMMENT_ID,
+            issueNumber: process.env.ISSUE_NUMBER,
+            runId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cache_key<<EOF\n${cacheKey}\nEOF\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `direct_probe_key<<EOF\n${cacheKey}-direct\nEOF\n`);
+          fs.writeFileSync('observations/issue-comment-dispatch-metadata.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+
+          cat > comment-direct-tools/deploy.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "tool-source=issue-comment-direct-cache-probe"
+          EOF
+          chmod +x comment-direct-tools/deploy.sh
+
+      - name: Direct issue_comment cache write probe
+        id: direct_cache
+        continue-on-error: true
+        uses: actions/cache@v6
+        with:
+          path: comment-direct-tools
+          key: ${{ steps.seed.outputs.direct_probe_key }}
+
+      - name: Dispatch repository cache seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_KEY: ${{ steps.seed.outputs.cache_key }}
+          COMMENT_ACTOR: ${{ github.event.comment.user.login }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const payload = {
+            event_type: 'cache-comment-seed',
+            client_payload: {
+              cache_key: process.env.CACHE_KEY,
+              comment_actor: process.env.COMMENT_ACTOR,
+              comment_id: process.env.COMMENT_ID,
+              issue_number: process.env.ISSUE_NUMBER,
+              source_run_id: process.env.GITHUB_RUN_ID
+            }
+          };
+
+          fs.writeFileSync('repository-dispatch.json', `${JSON.stringify(payload, null, 2)}\n`);
+          NODE
+
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/dispatches" \
+            --input repository-dispatch.json
+
+      - name: Inspect issue_comment dispatch observations
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find observations comment-direct-tools -maxdepth 3 -type f -print -exec sed -n '1,80p' {} \; || true
+
+      - name: Upload issue_comment dispatch observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-issue-comment-dispatch-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn

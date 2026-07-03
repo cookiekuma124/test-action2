@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+lab-observations/
+lab-results/
+cache-fixture/
+cache-fixture*/
+\ cache-fixture/
+Cache-Fixture/
+cache-fixture-a/
+cache-fixture-b/
+cache-link
+run-created-at.txt
+cache-result.txt

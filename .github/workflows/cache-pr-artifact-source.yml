@@ -1,0 +1,82 @@
+name: Cache PR Artifact Source
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out PR merge commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build low-trust artifact payload
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          mkdir -p payload/deploy-tools payload/pr-signal observations
+
+          if [[ -f pr-payload/deploy.sh ]]; then
+            cp pr-payload/deploy.sh payload/deploy-tools/deploy.sh
+          else
+            cat > payload/deploy-tools/deploy.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "tool-label=default-pr-artifact-tool"
+          echo "secret-visible-to-tool=$([[ -n "${LAB_DEPLOY_SECRET:-}" ]] && echo true || echo false)"
+          echo "deploy-target=production"
+          EOF
+          fi
+          chmod +x payload/deploy-tools/deploy.sh
+
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function describe(value) {
+            return {
+              value,
+              length: value.length,
+              byteLength: Buffer.byteLength(value),
+              utf8Hex: Buffer.from(value, 'utf8').toString('hex'),
+              codePoints: [...value].map(char =>
+                `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+              )
+            };
+          }
+
+          const metadata = {
+            event: 'pull_request',
+            headRef: describe(process.env.HEAD_REF || ''),
+            headRepo: process.env.HEAD_REPO,
+            headSha: process.env.HEAD_SHA,
+            prNumber: process.env.PR_NUMBER,
+            sourceRunId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.writeFileSync('payload/pr-signal/cache-key.txt', `${process.env.HEAD_REF || ''}\n`);
+          fs.writeFileSync('payload/pr-signal/metadata.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          fs.writeFileSync('observations/pr-source-metadata.json', `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+
+      - name: Inspect low-trust payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          find payload observations -maxdepth 3 -type f -print -exec sed -n '1,40p' {} \;
+
+      - name: Upload low-trust payload
+        uses: actions/upload-artifact@v6
+        with:
+          name: pr-cache-seed-payload
+          path: payload/
+          if-no-files-found: error
