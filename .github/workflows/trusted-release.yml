@@ -1,0 +1,70 @@
+name: Trusted Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: Lab label for the generated trusted subject.
+        required: true
+        default: trusted-main
+
+permissions:
+  attestations: write
+  contents: read
+  id-token: write
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build trusted subject
+        shell: bash
+        env:
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist observations
+          {
+            echo "trusted-release-workflow=true"
+            echo "label=${LABEL}"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "workflow-ref=${GITHUB_WORKFLOW_REF}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "run-id=${GITHUB_RUN_ID}"
+          } > dist/trusted-release.txt
+          sha256sum dist/trusted-release.txt | tee observations/trusted-release.sha256
+          cp dist/trusted-release.txt observations/trusted-release.txt
+
+      - name: Attest trusted subject
+        id: attest
+        uses: actions/attest-build-provenance@v4.1.1
+        with:
+          subject-path: dist/trusted-release.txt
+
+      - name: Record attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "attestation-id=${ATTESTATION_ID}"
+            echo "attestation-url=${ATTESTATION_URL}"
+            echo "bundle-path=${BUNDLE_PATH}"
+          } | tee observations/attestation-outputs.txt
+          cp "${BUNDLE_PATH}" observations/attestation-bundle.json
+          gh attestation verify dist/trusted-release.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --format json > observations/gh-attestation-verify.json
+
+      - name: Upload observations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trusted-release-observations-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations/
+          if-no-files-found: warn
