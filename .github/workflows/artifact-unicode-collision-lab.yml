@@ -1,0 +1,121 @@
+name: Artifact Unicode Collision Lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare Unicode-equivalent files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf payload
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("payload")
+          files = {
+              "dist/release-\u00e9.txt": "trusted-nfc\n",
+              "dist/release-e\u0301.txt": "attacker-nfd\n",
+              "bin/tool-A.js": "trusted-ascii-A\n",
+              "bin/tool-\uff21.js": "attacker-fullwidth-A\n",
+              "lib-ff.txt": "trusted-ascii-ff\n",
+              "lib-\ufb00.txt": "attacker-ligature-ff\n",
+              "case.txt": "trusted-lowercase\n",
+              "CASE.txt": "attacker-uppercase\n",
+          }
+          for name, body in files.items():
+              path = root / name
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(body, encoding="utf-8")
+
+          for path in sorted(p for p in root.rglob("*") if p.is_file()):
+              rel = str(path.relative_to(root))
+              print(repr(rel), path.read_bytes().hex())
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: unicode-collision-payload
+          path: payload
+          include-hidden-files: true
+
+  inspect:
+    needs: upload
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: unicode-collision-payload
+          path: downloaded
+
+      - name: Inspect downloaded files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PY=python3
+          else
+            PY=python
+          fi
+          "$PY" - <<'PY'
+          from pathlib import Path
+          import unicodedata
+
+          root = Path("downloaded")
+          expected = {
+              "dist/release-\u00e9.txt": "trusted-nfc",
+              "dist/release-e\u0301.txt": "attacker-nfd",
+              "bin/tool-A.js": "trusted-ascii-A",
+              "bin/tool-\uff21.js": "attacker-fullwidth-A",
+              "lib-ff.txt": "trusted-ascii-ff",
+              "lib-\ufb00.txt": "attacker-ligature-ff",
+              "case.txt": "trusted-lowercase",
+              "CASE.txt": "attacker-uppercase",
+          }
+
+          files = sorted(p for p in root.rglob("*") if p.is_file())
+          print(f"downloaded_count={len(files)}")
+          print("filesystem_entries:")
+          for path in files:
+              rel = str(path.relative_to(root))
+              content = path.read_text(encoding="utf-8", errors="replace").strip()
+              print(
+                  repr(rel),
+                  "nfc=" + repr(unicodedata.normalize("NFC", rel)),
+                  "nfkc=" + repr(unicodedata.normalize("NFKC", rel)),
+                  "content=" + repr(content),
+              )
+
+          print("expected_path_reads:")
+          for rel, wanted in expected.items():
+              path = root / rel
+              exists = path.exists()
+              content = path.read_text(encoding="utf-8", errors="replace").strip() if exists else "<missing>"
+              status = "OK" if content == wanted else "MISMATCH"
+              print(repr(rel), f"exists={exists}", "content=" + repr(content), status)
+
+          for form in ("NFC", "NFKC"):
+              groups = {}
+              for rel in expected:
+                  key = unicodedata.normalize(form, rel).casefold()
+                  groups.setdefault(key, []).append(rel)
+              print(f"{form}+casefold_expected_groups:")
+              for key, names in groups.items():
+                  if len(names) > 1:
+                      print(repr(key), "<-", repr(names))
+          PY
